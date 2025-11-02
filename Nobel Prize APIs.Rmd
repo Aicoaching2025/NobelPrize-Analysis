@@ -1,0 +1,705 @@
+---
+title: "Nobel Prize API Data Analysis"
+author: "Candace Grant"
+output:
+ html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Import libraries and packages
+
+```{r echo=FALSE}
+library(httr)
+library(jsonlite)
+library(tidyverse)
+library(lubridate)
+library(ggplot2)
+```
+
+### Fetch data from API
+
+```{r}
+API_URL <- "https://api.nobelprize.org/2.1/laureates"
+
+# Initialize
+all_laureates <- list()
+offset <- 0
+limit <- 100  # Fetch 100 at a time
+
+repeat {
+  # Build URL with pagination
+  url <- paste0(API_URL, "?offset=", offset, "&limit=", limit)
+  
+  response <- GET(url)
+  
+  if (status_code(response) != 200) {
+    stop(paste("API Error: Status code", status_code(response)))
+  }
+  
+  data <- content(response, as = "text", encoding = "UTF-8")
+  laureates_json <- fromJSON(data, flatten = TRUE)
+  
+  # Get laureates from this batch
+  batch <- laureates_json$laureates
+  
+  if (is.null(batch) || nrow(batch) == 0) {
+    break  # No more data
+  }
+  
+  all_laureates[[length(all_laureates) + 1]] <- batch
+  
+  print(paste("Fetched", nrow(batch), "laureates. Total so far:", 
+              sum(sapply(all_laureates, nrow))))
+  
+  # Check if we got less than limit (last page)
+  if (nrow(batch) < limit) {
+    break
+  }
+  
+  offset <- offset + limit
+}
+
+# Combine all batches
+laureates <- bind_rows(all_laureates)
+
+print(paste(" Total laureates fetched:", nrow(laureates)))
+
+ 
+```
+
+### Data exploration
+
+```{r}
+# View structure
+#glimpse(laureates)
+
+# Check column names
+colnames(laureates)
+
+# View first laureate's name
+laureates$knownName.en[1]
+
+# Nobel prizes are nested - let's look at one
+laureates$nobelPrizes[[1]]
+```
+
+### Analytical questions for the Nobel Peace Prize Portfolio
+
+- How has the distribution of Nobel Prize winners shifted across continents over the past 50 years?
+- How has the Median Age of Laureates Changed in the Past Fifty Years?
+- What percentage of prizes are shared among 2-3 winners versus awarded to individuals? 
+- Which universities and research institutions have produced the most Nobel laureates in the last 30 years?
+- Who were the youngest Nobel Prize winners from each major geographic region at the time of their award?
+- Which Nobel Prize categories have awarded the most prize?
+
+### Question 1: Continental distribution of Nobel Prize winners (1975-2025)
+
+```{r echo=FALSE}
+# Step 1: Unnest and Clean Data
+
+# Unnest the nobelPrizes data
+laureates_expanded <- laureates %>%
+  unnest(nobelPrizes, names_sep = "_") %>%
+  filter(!is.na(nobelPrizes_awardYear))
+
+print(paste("Total laureate-prize records:", nrow(laureates_expanded)))
+
+# Create clean dataset for geographic analysis
+nobel_geographic <- laureates_expanded %>%
+  select(
+    laureate_id = id,
+    name = knownName.en,
+    gender,
+    birth_continent = birth.place.continent.en,
+    birth_country = birth.place.countryNow.en,
+    award_year = nobelPrizes_awardYear,
+    category = nobelPrizes_category.en,
+    prize_share = nobelPrizes_portion
+  ) %>%
+  mutate(
+    award_year = as.numeric(award_year),
+    # Create decade periods
+    decade = case_when(
+      award_year >= 1975 & award_year < 1985 ~ "1975-1984",
+      award_year >= 1985 & award_year < 1995 ~ "1985-1994",
+      award_year >= 1995 & award_year < 2005 ~ "1995-2004",
+      award_year >= 2005 & award_year < 2015 ~ "2005-2014",
+      award_year >= 2015 & award_year <= 2025 ~ "2015-2024",
+      TRUE ~ "Before 1975"
+    )
+  ) %>%
+  filter(award_year >= 1975 & award_year <= 2025)  # Last 50 years
+
+# Check for missing continents
+print(paste("Records with missing continent:", sum(is.na(nobel_geographic$birth_continent))))
+
+# Step 2: Calculate Continental Distribution
+
+# Distribution by decade and continent
+continental_distribution <- nobel_geographic %>%
+  filter(!is.na(birth_continent)) %>%
+  group_by(decade, birth_continent) %>%
+  summarise(
+    count = n(),
+    .groups = "drop"
+  ) %>%
+  group_by(decade) %>%
+  mutate(
+    total = sum(count),
+    percentage = round((count / total) * 100, 2)
+  ) %>%
+  ungroup()
+
+# View the distribution table
+print("Continental Distribution by Decade:")
+print(continental_distribution %>% 
+        select(decade, birth_continent, count, percentage) %>%
+        arrange(decade, desc(count)))
+
+# Summary table (wide format)
+continental_summary <- continental_distribution %>%
+  select(decade, birth_continent, count) %>%
+  pivot_wider(
+    names_from = decade,
+    values_from = count,
+    values_fill = 0
+  )
+```
+
+### Continental distribution summary table
+
+```{r echo=FALSE}
+print("\nSummary Table (Wide Format):")
+print(continental_summary)
+
+
+# Step 3:Create Visualizations
+# Define pastel color palette
+pastel_colors <- c(
+  "Europe" = "#B4A7D6",          
+  "North America" = "#A8D8EA",    
+  "Asia" = "#FFCAB1",            
+  "Africa" = "#014D4E",         
+  "South America" = "#CD5B45",    
+  "Oceania" = "#FFF1A8"          
+)
+```
+
+### Continental distribution stacked bar chart
+
+```{r echo=FALSE}
+# Stacked area chart (FIXED)
+viz1 <- ggplot(continental_distribution, 
+               aes(x = decade, y = percentage, fill = birth_continent, 
+                   group = birth_continent)) +
+  geom_area(alpha = 0.8, color = "white", linewidth = 0.5) +  # Changed linewidth to size
+  scale_fill_manual(values = pastel_colors) +
+  labs(
+    title = "How Nobel Prize Winners' Continental Origins\nHave Shifted (1975-2024)",
+    subtitle = "Percentage distribution showing the rise of Asia and relative decline of Europe",
+    x = "Decade",
+    y = "Percentage of Laureates (%)",
+    fill = "Continent of Birth",
+    caption = "Source: Nobel Prize API | Analysis Period: 50 years (1975-2024)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(size = 15, face = "bold", hjust = 0),
+    plot.subtitle = element_text(size = 11, color = "gray40", hjust = 0),
+    plot.caption = element_text(size = 9, color = "gray50", hjust = 1),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+    axis.text.y = element_text(size = 10),
+    legend.position = "right",
+    legend.title = element_text(size = 11, face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+print(viz1)
+
+# Save the plot
+ggsave("nobel_continental_area_chart.png", viz1, width = 12, height = 7, dpi = 300)
+```
+
+### Continental winners trend line
+
+```{r}
+viz3 <- ggplot(continental_distribution, 
+               aes(x = decade, y = percentage, color = birth_continent, 
+                   group = birth_continent)) +
+  geom_line(linewidth = 1.2, alpha = 0.9) +
+  geom_point(size = 3, alpha = 0.9) +
+  scale_color_manual(values = pastel_colors) +
+  labs(
+    title = "Continental Trends in Nobel Prize Winners (1975-2024)",
+    subtitle = "Asia shows strongest upward trajectory while Europe declines proportionally",
+    x = "Decade",
+    y = "Percentage of Laureates (%)",
+    color = "Continent of Birth",
+    caption = "Source: Nobel Prize API"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(size = 15, face = "bold", hjust = 0),
+    plot.subtitle = element_text(size = 11, color = "gray40", hjust = 0),
+    plot.caption = element_text(size = 9, color = "gray50", hjust = 1),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+    legend.position = "right",
+    legend.title = element_text(size = 11, face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+print(viz3)
+
+# Save the plot
+ggsave("nobel_continental_trend_lines.png", viz3, width = 12, height = 7, dpi = 300)
+```
+### Analysis of the distribition of Nobel Prize wnners across continents over the past 50 years
+
+- Europe's Decline: Europe's share decreased from 49.5% (1975-1984) to approximately 35-40% in recent decades, showing a relative decline in dominance.
+- Asia's Rise: Asia's representation increased dramatically from just 3% (1975-1984) to over 18% (2015-2024), representing a more than 6-fold increase.
+- North America's Stability: North America maintained relatively stable representation at 39-48% across all decades, showing consistent scientific output.
+- Underrepresented Regions: Africa, South America, and Oceania continue to have minimal representation (under 5% combined), indicating persistent geographic inequality in Nobel   
+  Prize recognition.
+
+
+### Question 2: How has the median age of laureates changed in the past 50 years?
+
+```{r}
+### Median age at award by category and decade
+
+# Use the more precise prize date when available; otherwise default to Dec 10 of the award year
+age_by_category_decade <- laureates_expanded %>%
+  filter(!is.na(nobelPrizes_awardYear)) %>%
+  mutate(
+    award_year = as.integer(nobelPrizes_awardYear),
+    # Prefer exact date if present (e.g., "YYYY-MM-DD"); else assume Nobel ceremony date (Dec 10)
+    award_date_exact = suppressWarnings(lubridate::ymd(nobelPrizes_dateAwarded)),
+    award_date_fallback = lubridate::ymd(paste0(award_year, "-12-10")),
+    award_date = dplyr::coalesce(award_date_exact, award_date_fallback),
+    birth_date = suppressWarnings(lubridate::ymd(birth.date)),
+    age_at_award = as.numeric(lubridate::interval(birth_date, award_date) / lubridate::years(1)),
+    category = nobelPrizes_category.en,
+    decade = dplyr::case_when(
+      award_year >= 1975 & award_year < 1985 ~ "1975-1984",
+      award_year >= 1985 & award_year < 1995 ~ "1985-1994",
+      award_year >= 1995 & award_year < 2005 ~ "1995-2004",
+      award_year >= 2005 & award_year < 2015 ~ "2005-2014",
+      award_year >= 2015 & award_year <= 2025 ~ "2015-2024",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  # Keep sensible records
+  filter(!is.na(birth_date), !is.na(award_date), !is.na(age_at_award),
+         age_at_award > 0, !is.na(category), !is.na(decade))
+```
+
+### Median age by nobel prize category
+
+```{r}
+# Summary table: median age by category & decade (+ count for context)
+median_age_tbl <- age_by_category_decade %>%
+  group_by(category, decade) %>%
+  summarise(
+    median_age = round(stats::median(age_at_award, na.rm = TRUE), 1),
+    n = dplyr::n(),
+    .groups = "drop"
+  ) %>%
+  arrange(category, decade)
+
+print(median_age_tbl)
+
+# Optional: wide-format table (categories as rows, decades as columns)
+median_age_wide <- median_age_tbl %>%
+  select(category, decade, median_age) %>%
+  tidyr::pivot_wider(names_from = decade, values_from = median_age) %>%
+  arrange(category)
+
+print(median_age_wide)
+```
+
+###  Visualization of faceted lines of median age by category across decades
+
+```{r}
+# Visualization: faceted lines by category across decades
+viz_median_age <- ggplot(median_age_tbl,
+                         aes(x = decade, y = median_age, group = category)) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 3) +
+  labs(
+    title = "Median Age at Nobel Prize Award by Category and Decade",
+    subtitle = "Based on Nobel Prize API data; exact award date used when available",
+    x = "Decade",
+    y = "Median age (years)",
+    caption = "Source: Nobel Prize API (laureates endpoint)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(size = 15, face = "bold", hjust = 0),
+    plot.subtitle = element_text(size = 11, color = "gray40", hjust = 0),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.minor = element_blank()
+  ) +
+  facet_wrap(~ category, scales = "free_y")
+
+print(viz_median_age)
+
+ggsave("median_age_by_category_decade.png", viz_median_age,
+       width = 12, height = 8, dpi = 300)
+```
+
+### Analysis of the median age of laureates in the past fifty 50 years?
+
+- Scientific categories show pronounced upward trajectories, with Physics experiencing the steepest increase. This suggests growing complexity in scientific validation and the    
+  extended time required for breakthrough discoveries to gain consensus recognition.
+- Literature & Economics: Moderate increases with some volatility, suggesting field-specific recognition dynamics
+- The data suggests that peak scientific recognition now occurs 10-20 years later than in the 1970s,
+
+
+### Question 3: What percentage of prizes are shared among 2-3 winners versus awarded to individuals? 
+
+```{r}
+## ANALYSIS: How often are prizes shared vs. individual?
+
+# Build prize-level rows by counting distinct laureates per prize
+prize_level <- laureates_expanded %>%
+  mutate(
+    award_year = as.integer(nobelPrizes_awardYear),
+    category   = nobelPrizes_category.en
+  ) %>%
+  filter(!is.na(award_year), award_year >= 1975, award_year <= 2025,
+         !is.na(category), !is.na(id)) %>%
+  group_by(award_year, category) %>%
+  summarise(
+    recipients = n_distinct(id),  # number of laureates attached to that prize
+    .groups = "drop"
+  ) %>%
+  mutate(
+    share_type = case_when(
+      recipients == 1 ~ "Individual (1)",
+      recipients %in% 2:3 ~ "Shared (2–3)",
+      recipients >= 4 ~ "Shared (4+)"
+    ),
+    decade = case_when(
+      award_year >= 1975 & award_year < 1985 ~ "1975-1984",
+      award_year >= 1985 & award_year < 1995 ~ "1985-1994",
+      award_year >= 1995 & award_year < 2005 ~ "1995-2004",
+      award_year >= 2005 & award_year < 2015 ~ "2005-2014",
+      award_year >= 2015 & award_year <= 2025 ~ "2015-2024",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(decade))
+
+# Overall percentages (1975–2024)
+sharing_overall <- prize_level %>%
+  count(share_type, name = "prize_count") %>%
+  mutate(percentage = round(100 * prize_count / sum(prize_count), 1)) %>%
+  arrange(desc(percentage))
+
+print(sharing_overall)
+
+# Percentages by decade
+sharing_by_decade <- prize_level %>%
+  count(decade, share_type, name = "prize_count") %>%
+  group_by(decade) %>%
+  mutate(percentage = 100 * prize_count / sum(prize_count)) %>%
+  ungroup()
+
+```
+
+### Data visualization showing the percentage of prizes are shared among 2-3 winners versus awarded to individuals? 
+
+```{r}
+library(ggplot2)
+library(scales)
+
+viz_share_decade <- ggplot(sharing_by_decade,
+                           aes(x = decade, y = percentage, fill = share_type)) +
+  geom_col(width = 0.72) +
+  scale_y_continuous(labels = label_percent(scale = 1), expand = expansion(mult = c(0, 0.02))) +
+  labs(
+    title = "How Often Nobel Prizes Are Shared vs. Individual (1975–2024)",
+    subtitle = "Share of prizes per decade",
+    x = "Decade", y = "Percentage of prizes",
+    fill = "Prize type"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 15, hjust = 0),
+    plot.subtitle = element_text(color = "gray40", hjust = 0),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.minor = element_blank(),
+    legend.position = "right"
+  )
+
+print(viz_share_decade)
+ggsave("nobel_prize_sharing_by_decade.png", viz_share_decade, width = 11, height = 6.5, dpi = 300)
+
+```
+### Analysis of the distribution of prizes shared among 2-3 winners versus awarded to Individuals
+
+- Shared prizes begin to outnumber individual prizes beginning in 1995 and the distribution of shared prizes continued to outnumber the amount of individual prizes awarded.
+
+### Question 4: Which universities and research institutions have produced the most nobel laureates in the last 50 years?
+
+```{r}
+# ----------------------------------------------------------------------------
+# IMPORTANT NOTE ABOUT METHODOLOGY
+# ----------------------------------------------------------------------------
+# This analysis counts institutional affiliations at time of award (where 
+# laureates were working when they received the prize), NOT where they:
+# - Earned their PhD
+# - Conducted their prize-winning research
+# - Were educated
+# 
+# Different methodologies will produce different rankings. Internet sources
+# may use different criteria (e.g., counting by PhD institution or research 
+# institution rather than affiliation at award time).
+# ----------------------------------------------------------------------------
+
+library(tidyverse)
+
+# ----------------------------------------------------------------------------
+# Extract Institution Data
+# ----------------------------------------------------------------------------
+
+# Get institutions from affiliations
+institutions_simple <- laureates_expanded %>%
+  filter(!is.na(nobelPrizes_awardYear)) %>%
+  mutate(award_year = as.numeric(nobelPrizes_awardYear)) %>%
+  filter(award_year >= 1975 & award_year <= 2025) %>%
+  unnest(nobelPrizes_affiliations, names_sep = "_", keep_empty = FALSE) %>%
+  filter(!is.na(nobelPrizes_affiliations_name.en)) %>%
+  select(
+    laureate_id = id,
+    award_year,
+    institution = nobelPrizes_affiliations_name.en,
+    country = nobelPrizes_affiliations_country.en
+  )
+
+# Count laureates per institution
+top_institutions <- institutions_simple %>%
+  group_by(institution, country) %>%
+  summarise(laureates = n_distinct(laureate_id), .groups = "drop") %>%
+  arrange(desc(laureates)) %>%
+  head(15)
+
+print("Top 15 Institutions:")
+print(top_institutions)
+
+# ----------------------------------------------------------------------------
+# Bar chart
+# ----------------------------------------------------------------------------
+
+viz_simple <- ggplot(top_institutions, 
+                     aes(x = reorder(institution, laureates),  
+                         y = laureates)) +
+  geom_col(fill = "#FF5F1F", alpha = 0.85, width = 0.7) +
+  geom_text(aes(label = laureates), 
+            hjust = 1.2,
+            size = 4, 
+            fontface = "bold",
+            color = "navy") +
+  coord_flip() +
+  labs(
+    title = "Top 15 Institutions \n Producing Nobel Laureates\n (1975-2024)",
+    x = NULL,
+    y = "Number of Nobel Laureates",
+    caption = "Source: Nobel Prize API"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(size = 15, face = "bold"),
+    axis.text.y = element_text(size = 10, face = "bold"),  # Smaller text for long names
+    panel.grid.major.y = element_blank(),
+    plot.margin = margin(10, 10, 10, 80)  # Extra left margin for long names
+  )
+
+print(viz_simple)
+
+ggsave("nobel_institutions_simple.png", viz_simple, 
+       width = 14, height = 8, dpi = 300)  # Wider to accommodate long names
+
+# Quick summary
+cat("\nQuick Summary:\n")
+cat("Top Institution:", top_institutions$institution[1], 
+    "with", top_institutions$laureates[1], "laureates\n")
+cat("US institutions in top 15:", sum(top_institutions$country == "USA", na.rm = TRUE), "\n")
+```
+### Question 5: Who are the youngest nobel prize winners from each major geographic region at the time of their award?
+
+```{r}
+library(tidyverse)
+
+# ============================================================================
+# Question 5: Youngest Nobel Prize Winners by Region (1985-2025)
+# ============================================================================
+
+# Calculate age at award
+youngest_by_region <- nobel_geographic %>%
+  filter(award_year >= 1985 & award_year <= 2025) %>%
+  filter(!is.na(birth_continent) & !is.na(birth_country)) %>%
+  left_join(
+    laureates %>% select(id, birth.date),
+    by = c("laureate_id" = "id")
+  ) %>%
+  mutate(
+    birth_year = as.numeric(str_sub(birth.date, 1, 4)),
+    age_at_award = award_year - birth_year
+  ) %>%
+  filter(!is.na(age_at_award) & age_at_award > 0) %>%
+  group_by(birth_continent) %>%
+  arrange(age_at_award) %>%
+  slice(1) %>%
+  ungroup() %>%
+  arrange(age_at_award) %>%
+  select(name, birth_continent, birth_country, category, award_year, age_at_award)
+
+# Print results
+cat("\n", strrep("=", 80), "\n")
+cat("YOUNGEST NOBEL PRIZE WINNERS BY REGION AT TIME OF AWARD (1985-2025)\n")
+cat(strrep("=", 80), "\n\n")
+
+for(i in 1:nrow(youngest_by_region)) {
+  cat(sprintf("%s: %s (%s) - Age %d - %s %d\n",
+              youngest_by_region$birth_continent[i],
+              youngest_by_region$name[i],
+              youngest_by_region$birth_country[i],
+              youngest_by_region$age_at_award[i],
+              youngest_by_region$category[i],
+              youngest_by_region$award_year[i]))
+}
+
+cat("\n", strrep("=", 80), "\n")
+print(youngest_by_region)
+```
+
+### Analysis of the Results of the youngest Nobel Prize winners from each major geographic region at the time of their award?
+
+- Among the youngest laureates from each continent, Malala Yousafzai from Pakistan (Asia) stands out as the youngest overall at just 17 years old when she received the Peace Prize    in 2014, making her an extraordinary outlier in Nobel Prize history. 
+- The Peace Prize dominates this list, with five of the six youngest regional winners awarded in this category, reflecting that humanitarian achievements can be recognized earlier    in life compared to scientific contributions that typically require decades of research. 
+- Age disparities across regions are notable: while Asia's youngest winner was 17, South America's youngest laureate, María Corina Machado from Venezuela, was 58 years old when   
+  awarded the Peace Prize in 2025—highlighting significant variation in the age at which different regions produce Nobel-recognized contributions.
+
+###  Which Nobel Prize Categories has Awarded the Most OPrizes?
+
+```{r}
+library(tidyverse)
+
+
+# Count prizes by category and decade
+category_by_decade <- nobel_geographic %>%
+  filter(award_year >= 1975 & award_year <= 2025) %>%
+  filter(!is.na(category)) %>%
+  mutate(
+    decade = case_when(
+      award_year >= 1975 & award_year < 1985 ~ "1975-1984",
+      award_year >= 1985 & award_year < 1995 ~ "1985-1994",
+      award_year >= 1995 & award_year < 2005 ~ "1995-2004",
+      award_year >= 2005 & award_year < 2015 ~ "2005-2014",
+      award_year >= 2015 & award_year <= 2025 ~ "2015-2024",
+      TRUE ~ "Other"
+    )
+  ) %>%
+  filter(decade != "Other") %>%
+  group_by(decade, category) %>%
+  summarise(prizes = n(), .groups = "drop")
+
+# Overall totals by category
+category_totals <- category_by_decade %>%
+  group_by(category) %>%
+  summarise(total_prizes = sum(prizes), .groups = "drop") %>%
+  arrange(desc(total_prizes))
+
+# Print results
+cat("\n", strrep("=", 80), "\n")
+cat("NOBEL PRIZES BY CATEGORY (1975-2025)\n")
+cat(strrep("=", 80), "\n\n")
+
+cat("Overall Totals:\n")
+for(i in 1:nrow(category_totals)) {
+  cat(sprintf("%d. %s: %d prizes\n",
+              i,
+              category_totals$category[i],
+              category_totals$total_prizes[i]))
+}
+
+cat("\n\nBreakdown by Decade:\n")
+print(category_by_decade %>% 
+        pivot_wider(names_from = decade, values_from = prizes, values_fill = 0))
+
+# ============================================================================
+# Visualization: Stacked Bar Chart by Decade
+# ============================================================================
+
+# Pastel colors for categories
+category_colors <- c(
+  "Physics" = "#B4A7D6",              # Pastel purple
+  "Chemistry" = "#A8D8EA",            # Pastel blue
+  "Physiology or Medicine" = "#CD5B45", # Pastel coral
+  "Literature" = "#014D4E",           # Pastel teal
+  "Peace" = "#F7B7A3",                # Pastel peach
+  "Economic Sciences" = "#FFF1A8"     # Pastel yellow
+
+)
+
+viz_categories <- ggplot(category_by_decade, 
+                         aes(x = decade, y = prizes, fill = category)) +
+  geom_col(alpha = 0.85, width = 0.7) +
+  geom_text(aes(label = prizes), 
+            position = position_stack(vjust = 0.5),
+            size = 3.5, 
+            fontface = "bold",
+            color = "white") +
+  scale_fill_manual(values = category_colors) +
+  labs(
+    title = "Nobel Prize Distribution by Category\nAcross Five Decades (1975-2024)",
+    x = "Decade",
+    y = "Number of Prizes Awarded",
+    fill = "Category",
+    caption = "Source: Nobel Prize API"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(size = 15, face = "bold", hjust = 0.5),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10, face = "bold"),
+    axis.text.y = element_text(size = 10),
+    legend.position = "bottom",
+    legend.title = element_text(face = "bold"),
+    panel.grid.major.x = element_blank()
+  ) +
+  guides(fill = guide_legend(nrow = 2))
+
+print(viz_categories)
+
+ggsave("nobel_categories_by_decade.png", viz_categories, 
+       width = 12, height = 8, dpi = 300)
+
+```
+
+### Nobel Prize Distribution Across Decades
+
+**Overall Prize Distribution:**
+
+- Physics leads with 129 total prizes, showing the most consistent output across all five decades (20-31 prizes per decade)
+- Physiology or Medicine ranks second with 119 prizes, maintaining steady distribution (20-26 prizes per decade)
+- Chemistry follows with 114 prizes, displaying gradual growth from 15 (1975-1984) to 31 (2015-2024)
+- Economic Sciences awarded 90 prizes, showing stable growth as a relatively newer category (added 1969)
+- Peace distributed 72 prizes with consistent patterns (13-16 prizes per decade)
+- Literature awarded the fewest with only 51 prizes (10-11 per decade)
+
+**Decade-by-Decade Trends:**
+
+- 1975-1984: Scientific categories dominated, with Physics (24) and Medicine (26) leading
+- 1985-1994: Most balanced distribution across categories; total prizes slightly declined
+- 1995-2004: Peak decade with 116 total prizes; Chemistry and Physics both surged
+- 2005-2014: Slight decline in overall prizes; categories remained relatively stable
+- 2015-2024: Strongest decade for Chemistry (31 prizes) and Physics (31 prizes); notable growth in scientific recognition
+
+
